@@ -1,0 +1,329 @@
+<#
+tools/sim_tools.ps1
+Core PowerShell toolkit for running SITL/HIL sims, Monte Carlo, fault injection and analysis.
+Usage examples at the bottom.
+#>
+
+# Path to your simulator/executable - change to your environment
+$Global:SimulatorPath = "C:\sat_tools\sat_sim.exe"
+
+function Start-Sim {
+    <#
+    Start-Sim -Seed 123 -Scenario "burn1" -OutFile ".\logs\run_123.csv" -ExtraArgs "--duration 300"
+    #>
+    param(
+        [int]$Seed = 1,
+        [string]$Scenario = "default",
+        [string]$OutFile = ".\logs\run_${Seed}.csv",
+        [string]$ExtraArgs = ""
+    )
+
+    if (-not (Test-Path $Global:SimulatorPath)) {
+        throw "Simulator not found at $Global:SimulatorPath ($Global:SimulatorPath). Edit the script to set the correct path."
+    }
+
+    $args = "--seed $Seed --scenario $Scenario --out `"$OutFile`" $ExtraArgs"
+    Write-Output "Starting simulator: $Global:SimulatorPath $args"
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $Global:SimulatorPath
+    $startInfo.Arguments = $args
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError  = $true
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+
+    $p = [System.Diagnostics.Process]::Start($startInfo)
+    $stdOut = $p.StandardOutput
+    $stdErr = $p.StandardError
+
+    # asynchronous logging to file
+    $logFile = [IO.Path]::ChangeExtension($OutFile, ".log")
+    $sw = [System.IO.File]::CreateText($logFile)
+    Start-Job -ScriptBlock {
+        param($sOut,$sErr,$sw)
+        while (-not $sOut.EndOfStream) {
+            $line = $sOut.ReadLine()
+            $sw.WriteLine($line)
+        }
+        while (-not $sErr.EndOfStream) {
+            $line = $sErr.ReadLine()
+            $sw.WriteLine($line)
+        }
+        $sw.Flush()
+        $sw.Close()
+    } -ArgumentList $stdOut, $stdErr, $sw | Out-Null
+
+    return $p  # caller may WaitForExit or kill
+}
+
+function Run-MonteCarlo {
+    <#
+    Run-MonteCarlo -Runs 200 -Scenario "burn1" -OutFolder ".\logs\mc"
+    Will spawn simulator runs serially (change to parallel if your host can handle concurrency).
+    #>
+    param(
+        [int]$Runs = 100,
+        [string]$Scenario = "default",
+        [string]$OutFolder = ".\logs\mc",
+        [int]$StartSeed = 1,
+        [switch]$Parallel,
+        [int]$MaxParallel = 4,
+        [string]$ExtraArgs = ""
+    )
+
+    New-Item -ItemType Directory -Path $OutFolder -Force | Out-Null
+
+    $jobs = @()
+    for ($i = 0; $i -lt $Runs; $i++) {
+        $seed = $StartSeed + $i
+        $outfile = Join-Path $OutFolder ("run_{0:0000}.csv" -f $seed)
+        $script = {
+            param($seed,$scenario,$outfile,$extra)
+            & pwsh -NoProfile -Command {
+                param($seed,$scenario,$outfile,$extra)
+                . $(Join-Path (Get-Location) "tools\sim_tools.ps1")
+                Start-Sim -Seed $seed -Scenario $scenario -OutFile $outfile -ExtraArgs $extra | Wait-Process
+            } -ArgumentList $seed,$scenario,$outfile,$extra
+        }
+
+        if ($Parallel) {
+            # Throttle parallel jobs
+            while ((Get-Job -State Running).Count -ge $MaxParallel) { Start-Sleep -Milliseconds 200 }
+            Start-Job -ScriptBlock $script -ArgumentList $seed,$Scenario,$outfile,$ExtraArgs | Out-Null
+        } else {
+            # serial run: block until finished
+            $proc = Start-Sim -Seed $seed -Scenario $Scenario -OutFile $outfile -ExtraArgs $ExtraArgs
+            $proc.WaitForExit()
+            Write-Output "Completed run seed=$seed -> $outfile"
+        }
+    }
+
+    if ($Parallel) {
+        Write-Output "Waiting for background jobs..."
+        Get-Job | Wait-Job
+        Write-Output "All jobs complete."
+    }
+}
+
+# Fault injection examples: adapt to simulator API or testbed controls
+function Inject-Fault {
+    <#
+    A small library of fault injection actions. These are stubs — adapt to your simulator or lab.
+    Examples:
+      Inject-Fault -Type "GNSS_Outage" -Duration 30 -Target "sim:1234"
+      Inject-Fault -Type "Actuator_Lag" -Duration 10 -Magnitude 0.2 -Target "hw:COM3"
+    #>
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet("GNSS_Outage","PortDown","Actuator_Lag","CPU_Starve")] 
+        [string]$Type,
+        [int]$Duration = 10,
+        [double]$Magnitude = 0.0,
+        [string]$Target = ""
+    )
+
+    switch ($Type) {
+        "GNSS_Outage" {
+            Write-Output "Simulating GNSS outage for $Duration s on target $Target"
+            # If simulator exposes an HTTP API: call it
+            # Invoke-RestMethod -Uri "http://$Target/api/faults" -Method Post -Body @{fault='gnss_down'; duration=$Duration}
+            # If using process control: touch a file used by the sim to trigger outage
+            $flag = "C:\tmp\gnss_out.flag"
+            New-Item -ItemType File -Path $flag -Force | Out-Null
+            Start-Sleep -Seconds $Duration
+            Remove-Item $flag -Force
+            Write-Output "GNSS outage cleared."
+        }
+        "PortDown" {
+            Write-Output "Bringing down NIC or virtual link for $Duration s (requires admin privileges)."
+            # Example: on Windows you might use NetAdapter or call out to lab switch API
+            # Disable-NetAdapter -Name "Ethernet0" -Confirm:$false
+            Start-Sleep -Seconds $Duration
+            # Enable-NetAdapter -Name "Ethernet0" -Confirm:$false
+            Write-Output "Port restored."
+        }
+        "Actuator_Lag" {
+            Write-Output "Injecting actuator lag: $Magnitude s for $Duration s. Target: $Target"
+            # Implementation depends on actuator interface. Could write to a control socket the sim reads.
+            Start-Sleep -Seconds $Duration
+            Write-Output "Actuator lag removed."
+        }
+        "CPU_Starve" {
+            Write-Output "Starting CPU hog for $Duration s on this host to test schedular effects"
+            $end = (Get-Date).AddSeconds($Duration)
+            $script = {
+                param($end)
+                while ((Get-Date) -lt $end) {
+                    # busy loop
+                    1..1000 | ForEach-Object { [math]::Sqrt($_) } > $null
+                }
+            }
+            Start-Job -ScriptBlock $script -ArgumentList $end | Out-Null
+        }
+    }
+}
+
+# Accurate percentile computation - no external dependencies
+function Compute-Percentiles {
+    <#
+    Compute-Percentiles -Values (Get-Content latencies.txt | ForEach-Object {[double]$_}) -Percentiles 50,90,99,99.9
+    Returns a hashtable of percentile->value
+    This implements the common interpolation method:
+      - sort array
+      - position = p/100*(N-1) + 1 (1-based), uses linear interpolation between neighbors
+    #>
+    param(
+        [Parameter(Mandatory=$true)][double[]]$Values,
+        [double[]]$Percentiles = @(50,90,99,99.9)
+    )
+
+    if ($Values.Count -eq 0) { throw "Values array empty" }
+    $arr = $Values | Sort-Object
+    $n = $arr.Count
+    $results = @{}
+
+    foreach ($p in $Percentiles) {
+        if ($p -lt 0 -or $p -gt 100) { throw "Percentile must be 0..100" }
+        # compute zero-based index method (linear interpolation)
+        $rank = $p/100.0 * ($n - 1)   # rank in [0, n-1]
+        $lowIndex = [int][math]::Floor($rank)
+        $highIndex = [int][math]::Ceiling($rank)
+        $lowVal = [double]$arr[$lowIndex]
+        $highVal = [double]$arr[$highIndex]
+        if ($highIndex -eq $lowIndex) {
+            $val = $lowVal
+        } else {
+            $frac = $rank - $lowIndex
+            $val = $lowVal + $frac * ($highVal - $lowVal)
+        }
+        $results["$p"] = $val
+    }
+    return $results
+}
+
+# Analyze multiple runs and compute RMSE + percentiles for latency and WCET
+function Analyze-Results {
+    <#
+    Analyze-Results -Folder ".\logs\mc" -OutSummary ".\artifacts\summary.csv"
+    Expects each run CSV to have columns: timestamp, true_x,true_y,true_z, est_x,est_y,est_z, latency_usec, wcet_usec
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Folder,
+        [string]$OutSummary = ".\artifacts\summary.csv"
+    )
+
+    $files = Get-ChildItem -Path $Folder -Filter '*.csv' | Sort-Object Name
+    if ($files.Count -eq 0) { throw "No CSV runs found in $Folder" }
+
+    $summary = @()
+    $allLat = @()
+    $allWcet = @()
+
+    foreach ($f in $files) {
+        $rows = Import-Csv -Path $f.FullName
+        # compute per-run RMSE of position error
+        $sumSq = 0.0
+        $count = 0
+        $latList = @()
+        $wcetList = @()
+        foreach ($r in $rows) {
+            # careful numeric conversion
+            $tx = [double]$r.true_x; $ty = [double]$r.true_y; $tz = [double]$r.true_z
+            $ex = [double]$r.est_x; $ey = [double]$r.est_y; $ez = [double]$r.est_z
+            $dx = $tx - $ex; $dy = $ty - $ey; $dz = $tz - $ez
+            $sumSq += ($dx*$dx + $dy*$dy + $dz*$dz)
+            $count++
+            $lat = [double]$r.latency_usec
+            $wcet = [double]$r.wcet_usec
+            $latList += $lat
+            $wcetList += $wcet
+            $allLat += $lat
+            $allWcet += $wcet
+        }
+        $rmse = [math]::Sqrt($sumSq / $count)
+        $p = Compute-Percentiles -Values $latList -Percentiles @(50,90,99,99.9)
+        $w = Compute-Percentiles -Values $wcetList -Percentiles @(50,90,99)
+        $summary += [PSCustomObject]@{
+            Run = $f.Name
+            Samples = $count
+            RMSE_m = [math]::Round($rmse,6)
+            Lat_p50_us = [math]::Round($p['50'],4)
+            Lat_p90_us = [math]::Round($p['90'],4)
+            Lat_p99_us = [math]::Round($p['99'],4)
+            Lat_p999_us = [math]::Round($p['99.9'],4)
+            WCET_p50_us = [math]::Round($w['50'],4)
+            WCET_p90_us = [math]::Round($w['90'],4)
+            WCET_p99_us = [math]::Round($w['99'],4)
+        }
+    }
+
+    # overall stats (aggregate)
+    $aggLat = Compute-Percentiles -Values $allLat -Percentiles @(50,90,99)
+    $aggWcet = Compute-Percentiles -Values $allWcet -Percentiles @(50,90,99)
+    Write-Output "Aggregate latency p50/p90/p99 (us): $($aggLat['50']) / $($aggLat['90']) / $($aggLat['99'])"
+
+    # save summary CSV
+    $summary | Export-Csv -Path $OutSummary -NoTypeInformation -Force
+    Write-Output "Saved summary to $OutSummary"
+    return $summary
+}
+
+# Monitor logs for WCET misses (simple tail/alert)
+function Monitor-WCET {
+    param(
+        [Parameter(Mandatory=$true)] [string]$LogCsv,
+        [double]$WcetThresholdUs = 500.0,
+        [int]$PollSeconds = 2
+    )
+
+    if (-not (Test-Path $LogCsv)) { throw "Log CSV not found: $LogCsv" }
+    Write-Output "Monitoring $LogCsv for WCET > $WcetThresholdUs us (poll every $PollSeconds s)..."
+
+    $lastSize = (Get-Item $LogCsv).Length
+    while ($true) {
+        Start-Sleep -Seconds $PollSeconds
+        $curSize = (Get-Item $LogCsv).Length
+        if ($curSize -le $lastSize) { continue }
+        $stream = New-Object System.IO.FileStream($LogCsv,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
+        $sr = New-Object System.IO.StreamReader($stream)
+        $sr.BaseStream.Seek($lastSize, [System.IO.SeekOrigin]::Begin) | Out-Null
+        while (-not $sr.EndOfStream) {
+            $line = $sr.ReadLine()
+            if ($line -and $line -match ",") {
+                # attempt to parse last column named wcet_usec
+                $cols = $line -split ","
+                # naive: assume wcet is last column; adapt to your CSV format
+                $wcet = [double]$cols[-1]
+                if ($wcet -gt $WcetThresholdUs) {
+                    Write-Warning "WCET miss: $wcet us"
+                    # optionally send alert: email, webhook, or write to alert file
+                }
+            }
+        }
+        $lastSize = $stream.Length
+        $sr.Close(); $stream.Close()
+    }
+}
+
+<#
+Usage examples:
+
+# Run a single sim (blocking)
+. .\tools\sim_tools.ps1
+Start-Sim -Seed 42 -Scenario "burn1" -OutFile ".\logs\run_42.csv" -ExtraArgs "--duration 300" | Wait-Process
+
+# Run 100 Monte Carlo runs serially:
+Run-MonteCarlo -Runs 100 -Scenario "burn1" -OutFolder ".\logs\mc"
+
+# Run Monte Carlo in parallel (throttle to 8 concurrent)
+Run-MonteCarlo -Runs 200 -Scenario "burn1" -OutFolder ".\logs\mc" -Parallel -MaxParallel 8
+
+# Inject a GNSS outage for 30 seconds
+Inject-Fault -Type GNSS_Outage -Duration 30
+
+# Analyze results
+Analyze-Results -Folder ".\logs\mc" -OutSummary ".\artifacts\summary.csv"
+
+# Monitor a live log for WCET misses
+Monitor-WCET -LogCsv ".\logs\run_42.csv" -WcetThresholdUs 1000
+
+#>
