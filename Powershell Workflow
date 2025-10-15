@@ -1,0 +1,8 @@
+One Liner
+# create-repo.ps1
+$root = "C:\sat_fw_test"   # change as needed
+New-Item -ItemType Directory -Path $root -Force | Out-Null
+@("src","bin","bench","logs","artifacts","ci","tools") | ForEach-Object { New-Item -ItemType Directory -Path (Join-Path $root $_) -Force | Out-Null }
+Write-Output "Created repo at $root"
+
+
